@@ -1,0 +1,187 @@
+# Node.js
+# Build a general Node.js project with npm.
+# Add steps that analyze code, save build artifacts, deploy, and more:
+# https://docs.microsoft.com/azure/devops/pipelines/languages/javascript
+
+trigger: none
+#Trigger şimdilik devre dışı bırakıldı.
+
+stages:
+  - stage: DockerPush
+    jobs:
+
+      - job: NexusTest
+        pool: LocalAgents
+
+        # Variables
+        variables:
+          - name: GitCloneRepository
+            value: /home/ubuntu/repos
+          - name: helm-last-version
+            value: ""
+          - name: NexusUser
+            value: <username>
+          - name: NexusPassword
+            value: <your_password>
+          - name: helm-chart
+            value: <repository_name> # Nexus içerisinde helm-hosted altında bu isimde!
+        steps:
+          # Short version extractor
+          - task: short-git-version-hash-extractor@1
+            displayName: 'Short Git Version Hash Extractor'
+
+          # Helm install
+          - task: HelmInstaller@0
+            displayName: 'Install Helm Latest'
+            inputs:
+              helmVersion: latest
+            continueOnError: true
+
+          # Node & Yarn install
+          - task: NodeTool@0
+            inputs:
+              versionSpec: '15.x'
+            displayName: 'Install Node.js'
+
+          - script: |
+              npm install yarn -g
+              yarn install
+
+            displayName: 'Yarn Install'
+          - script: |
+              yarn web:build
+            displayName: 'Yarn Production Build'
+
+          # Docker build and push
+          - task: Docker@2
+            inputs:
+              containerRegistry: '<container_registry_address>'
+              repository: '<container_repository_name>'
+              command: 'buildAndPush'
+              Dockerfile: '**/Dockerfile'
+              tags: |
+                $(ShortVersionHash)
+                latest
+
+          # Git clone
+          - bash: |
+              
+              ADGITAUTH=<PAT>
+              
+              B64_ADGITAUTH=$(printf "%s"":$ADGITAUTH" | base64)
+              
+              git config --global user.name "<username>"
+              git config --global user.email "<useremail>"
+              
+              git -c http.extraHeader="Authorization: Basic ${B64_ADGITAUTH}" clone <git_repository_URL> $(GitCloneRepository)
+            displayName: 'Git Clone Helm Chart'
+            continueOnError: true
+
+          # Python script
+          - task: PythonScript@0
+            displayName: 'Get specific version of a Nexus repository & get latest version'
+            inputs:
+              scriptSource: inline
+              script: |
+                import requests
+                
+                r = requests.get(url='<nexus_repository_URL>?repository=helm-hosted&name=$(helm-chart)', auth=('<username>','<userpass>'))
+                
+                dict_repos = r.json()
+                
+                repos_list = []
+                
+                for repo in dict_repos['items']:
+                    repo_dict = (
+                        repo['version']
+                    )
+                    repos_list.append(repo_dict)
+                
+                repos_list.sort(key=lambda x: [int(y) for y in x.split('.')],reverse=True)
+                
+                helmLastVersion = str(repos_list[0])
+                
+                print('##vso[task.setvariable variable=helm-last-version;]%s' % (helmLastVersion))
+
+              workingDirectory: '$(GitCloneRepository)'
+
+          # Patch semver
+          - task: yrtimid.semver-bump-task.semver-bump-task.semver-bump@1
+            displayName: 'Patch Helm Chart Version'
+            inputs:
+              VersionVariable: 'helm-last-version'
+
+
+          # Patch values.yaml
+          - task: YamlPatch@4
+            displayName: 'Patch values.yaml'
+            inputs:
+              SyntaxType: 'slick'
+              YamlWorkingDir: '$(GitCloneRepository)/$(helm-chart)'
+              YamlTargetFilters: 'values.yaml'
+              YamlPatchContent: |
+                = /annotations/repositoryUri => "$(BUILD_REPOSITORY_URI)"
+                = /annotations/commitId=> "$(ShortVersionHash)"
+                = /annotations/buildNumber=> "'$(BUILD_BUILDNUMBER)'"
+              OutputPatchFile: true
+              TreatErrors: 'ERROR'
+
+          # Patch chart.yaml
+          - task: YamlPatch@4
+            displayName: 'Patch Chart.yaml'
+            inputs:
+              SyntaxType: 'slick'
+              YamlWorkingDir: '$(GitCloneRepository)/$(helm-chart)'
+              YamlTargetFilters: 'Chart.yaml'
+              YamlPatchContent: '= /version => "$(helm-last-version)"'
+              OutputPatchFile: true
+              TreatErrors: 'ERROR'
+
+          # Helm package
+          - task: HelmDeploy@0
+            displayName: 'Helm Package'
+            inputs:
+              command: package
+              chartPath: '$(GitCloneRepository)/$(helm-chart)'
+              chartVersion: '$(helm-last-version)'
+              destination: '$(GitCloneRepository)/$(helm-chart)'
+
+          # Upload Helm Chart to Nexus Repository
+          - bash: |
+              pwd
+              
+              cd $(GitCloneRepository)/$(helm-chart)
+              
+              pwd
+              
+              #echo $(helm.helmOutput)
+              curl --upload-file $(helm-chart)-$(helm-last-version).tgz -u "$(NexusUser):$(NexusPassword)" <nexus_repository_URL> -vk
+            displayName: 'Upload Helm Chart to Nexus Repository'
+
+          # Git commit & push
+          - bash: |
+              cd $(GitCloneRepository)/$(helm-chart)
+              pwd
+              
+              git config --global user.name "<username>"
+              git config --global user.email "<useremail>"
+              
+              ADGITAUTH=<PAT>
+              
+              B64_ADGITAUTH=$(printf "%s"":$ADGITAUTH" | base64)
+              
+              
+              git add .
+              
+              git commit -m "updated"
+              
+              git -c http.extraHeader="Authorization: Basic ${B64_ADGITAUTH}" push --force <git_repository_URL>
+            displayName: 'Git Commit & Git Push'
+
+          # Cleanup working directory
+          - bash: |
+              rm -rf /home/ubuntu/repos/.* 
+              
+              rm -rf /home/ubuntu/repos/*
+            workingDirectory: '$(GitCloneRepository)'
+            displayName: 'Cleanup folders and files'
