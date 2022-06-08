@@ -1,0 +1,217 @@
+trigger: none
+#Trigger disabled for now.
+
+stages:
+  - stage: DockerPush
+    jobs:
+
+      - job: NexusTest
+        pool: LocalAgents
+
+        # Variables
+        variables:
+          - name: GitCloneRepository
+            value: /home/ubuntu/repos
+          - name: helm-last-version
+            value: ""
+          - name: NexusUser
+            value: <user_name>
+          - name: NexusPassword
+            value: <password>
+          - name: helm-chart
+            value: <chart_name 
+        steps:
+          # Short version extractor
+          - task: short-git-version-hash-extractor@1
+            displayName: 'Short Git Version Hash Extractor'
+
+          # Dotnet Build  
+          - task: UseDotNet@2
+            displayName: Use Dotnetcore 3.1
+            inputs:
+              packageType: 'sdk'
+              version: '3.1.x'
+          - task: DotNetCoreCLI@2
+            displayName: Dotnet Restore
+            inputs:
+              command: 'restore'
+              projects: '<project>.csproj'
+              feedsToUse: 'select'
+
+          - task: DotNetCoreCLI@2
+            displayName: Dotnet Build
+            inputs:
+              command: 'build'
+              projects: '<project>.csproj'
+              arguments: '--configuration $(buildConfiguration)'
+
+          - task: DotNetCoreCLI@2
+            displayName: Dotnet Publish
+            inputs:
+              command: 'publish'
+              publishWebProjects: false
+              projects: '<project>.csproj'
+              arguments: '--configuration $(BuildConfiguration) --output $(build.artifactstagingdirectory)'
+              zipAfterPublish: false
+              modifyOutputPath: false
+
+          - task: CopyFiles@2
+            displayName: Copy Dockerfile
+            inputs:
+              Contents: 'Dockerfile'
+              TargetFolder: '$(Build.ArtifactStagingDirectory)/'
+
+          - task: PublishBuildArtifacts@1
+            displayName: Publish Artifact
+            inputs:
+              PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+              ArtifactName: '<artifact_name>'
+              publishLocation: 'Container'
+
+          # Helm install
+          - task: HelmInstaller@0
+            displayName: 'Install Helm Latest'
+            inputs:
+              helmVersion: latest
+            continueOnError: true
+
+          # Download Dotnet Build Artifacts
+          - task: DownloadBuildArtifacts@0
+            inputs:
+              buildType: 'current'
+              downloadType: 'single'
+              artifactName: '<artifact_name>'
+              downloadPath: '$(System.DefaultWorkingDirectory)'
+
+          # Docker build and push
+          - task: Docker@2
+            inputs:
+              containerRegistry: '<container_registry_URL>' # Nexus
+              repository: 'beinconfiguration'
+              command: 'buildAndPush'
+              Dockerfile: '<docker_repo_folder>/Dockerfile'
+              tags: '$(ShortVersionHash)'
+
+          # Git clone
+          - bash: |
+              
+              ADGITAUTH=<PAT>
+              
+              B64_ADGITAUTH=$(printf "%s"":$ADGITAUTH" | base64)
+              
+              git config --global user.name "<user_name>"
+              git config --global user.email "<user_email>"
+              
+              git -c http.extraHeader="Authorization: Basic ${B64_ADGITAUTH}" clone <git_repository_URL> $(GitCloneRepository)
+            displayName: 'Git Clone Helm Chart'
+            continueOnError: true
+
+          # Python script
+          - task: PythonScript@0
+            displayName: 'Get specific version of a Nexus repository & get latest version'
+            inputs:
+              scriptSource: inline
+              script: |
+                import requests
+                
+                r = requests.get(url='<helm_repository_URL>?repository=helm-hosted&name=$(helm-chart)', auth=('<user_name>','<password>'))
+                
+                dict_repos = r.json()
+                
+                repos_list = []
+                
+                for repo in dict_repos['items']:
+                    repo_dict = (
+                        repo['version']
+                    )
+                    repos_list.append(repo_dict)
+                
+                repos_list.sort(key=lambda x: [int(y) for y in x.split('.')],reverse=True)
+                
+                helmLastVersion = str(repos_list[0])
+                
+                print('##vso[task.setvariable variable=helm-last-version;]%s' % (helmLastVersion))
+
+              workingDirectory: '$(GitCloneRepository)'
+
+          # Patch semver
+          - task: yrtimid.semver-bump-task.semver-bump-task.semver-bump@1
+            displayName: 'Patch Helm Chart Version'
+            inputs:
+              VersionVariable: 'helm-last-version'
+
+
+          # Patch values.yaml 
+          - task: YamlPatch@4
+            displayName: 'Patch values.yaml'
+            inputs:
+              SyntaxType: 'slick'
+              YamlWorkingDir: '$(GitCloneRepository)/$(helm-chart)'
+              YamlTargetFilters: 'values.yaml'
+              YamlPatchContent: |
+                + /annotations/repositoryUri => "$(BUILD_REPOSITORY_URI)"
+                + /annotations/commitId=> "$(ShortVersionHash)"
+                + /annotations/buildNumber=> "'$(BUILD_BUILDNUMBER)'"
+                = /image/tag=> "$(ShortVersionHash)"
+              OutputPatchFile: true
+              TreatErrors: 'ERROR'
+
+          # Patch chart.yaml
+          - task: YamlPatch@4
+            displayName: 'Patch Chart.yaml'
+            inputs:
+              SyntaxType: 'slick'
+              YamlWorkingDir: '$(GitCloneRepository)/$(helm-chart)'
+              YamlTargetFilters: 'Chart.yaml'
+              YamlPatchContent: '= /version => "$(helm-last-version)"'
+              OutputPatchFile: true
+              TreatErrors: 'ERROR'
+
+          # Helm package
+          - task: HelmDeploy@0
+            displayName: 'Helm Package'
+            inputs:
+              command: package
+              chartPath: '$(GitCloneRepository)/$(helm-chart)'
+              chartVersion: '$(helm-last-version)'
+              destination: '$(GitCloneRepository)/$(helm-chart)'
+
+          # Upload Helm Chart to Nexus Repository
+          - bash: |
+              pwd
+              
+              cd $(GitCloneRepository)/$(helm-chart)
+              
+              pwd
+              
+              #echo $(helm.helmOutput)
+              curl --upload-file $(helm-chart)-$(helm-last-version).tgz -u "$(NexusUser):$(NexusPassword)" <repository_URL>repository/helm-hosted/ -vk
+            displayName: 'Upload Helm Chart to Nexus Repository'
+
+          # Git commit & push
+          - bash: |
+              cd $(GitCloneRepository)/$(helm-chart)
+              pwd
+              
+              git config --global user.name "<user_name>"
+              git config --global user.email "<user_email>"
+              
+              ADGITAUTH=<PAT>
+              
+              B64_ADGITAUTH=$(printf "%s"":$ADGITAUTH" | base64)
+              
+              
+              git add .
+              
+              git commit -m "updated"
+              
+              git -c http.extraHeader="Authorization: Basic ${B64_ADGITAUTH}" push --force <git_repository_URL>
+            displayName: 'Git Commit & Git Push'
+
+          # Cleanup working directory
+          - bash: |
+              rm -rf /home/ubuntu/repos/.* 
+              
+              rm -rf /home/ubuntu/repos/*
+            workingDirectory: '$(GitCloneRepository)'
+            displayName: 'Cleanup folders and files'
